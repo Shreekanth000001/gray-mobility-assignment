@@ -1,0 +1,26 @@
+# Keeps the build context small (faster builds, better cache hits) and makes
+# sure local state and credentials never end up in an image layer.
+
+.git
+.github
+.gitignore
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local database — the container gets its own at /data.
+*.db
+*.sqlite3
+
+# Secrets: must come from Docker secrets / Kubernetes Secrets, never a layer.
+.env
+.env.*
+*.pem
+*.key
+
+k8s-manifest.yaml
+*.md
+!README.md

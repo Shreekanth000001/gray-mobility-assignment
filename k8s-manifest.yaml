@@ -1,0 +1,220 @@
+# ---------------------------------------------------------------------------
+# k8s-manifest.yaml — Identity Reconciliation service, v1
+#
+# Apply with:  kubectl apply -f k8s-manifest.yaml
+# Namespace isolation lets v1, v1.1 and v2.0 run side by side; copy this file
+# per version and change the namespace, image tag and Ingress path.
+# ---------------------------------------------------------------------------
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: identity-v1
+  labels:
+    app.kubernetes.io/name: identity-service
+    app.kubernetes.io/version: "1.0.0"
+
+---
+# Non-secret configuration. Anything credential-shaped belongs in a Secret
+# (or better, an external store surfaced via the Secrets Store CSI driver).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: identity-config
+  namespace: identity-v1
+data:
+  LOG_LEVEL: "INFO"
+  DATABASE_URL: "sqlite:////data/contacts.db"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: identity-service
+  namespace: identity-v1
+  labels:
+    app: identity-service
+    version: v1
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: identity-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0        # never drop below the desired count mid-rollout
+  template:
+    metadata:
+      labels:
+        app: identity-service
+        version: v1
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001         # lets the non-root user write to the mounted volume
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: identity-service
+          image: DOCKERHUB_USERNAME/identity-service:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: identity-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # requests = what the scheduler reserves and what the HPA measures
+          # utilisation against. Without requests, HPA has no denominator and
+          # simply refuses to scale.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          # Liveness: is the process wedged? Restart it.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness: should this pod receive traffic right now?
+          # Separate from liveness so a briefly-busy pod is pulled from the
+          # Service endpoints instead of being killed.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Startup probe protects slow first boots from the liveness probe.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 3
+            failureThreshold: 20
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp   # required because the root fs is read-only
+      volumes:
+        # emptyDir is deliberate for this exercise and deliberately wrong for
+        # production — see SYSTEM_DESIGN.md, "State".
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: identity-service
+  namespace: identity-v1
+  labels:
+    app: identity-service
+spec:
+  type: ClusterIP            # the Ingress is the only public entry point
+  selector:
+    app: identity-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: identity-service
+  namespace: identity-v1
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: identity-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70    # % of the 100m CPU *request*, not the limit
+  behavior:
+    scaleUp:
+      # React fast to a traffic spike.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Come down slowly so a momentary dip doesn't thrash the replica count.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: identity-service
+  namespace: identity-v1
+  annotations:
+    # The app serves /identify and /health at the root. The capture group
+    # below strips the /v1 prefix before the request reaches the pod, so the
+    # same image works behind any version prefix.
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: identity.local
+      http:
+        paths:
+          # /v1        -> /
+          # /v1/identify -> /identify
+          - path: /v1(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: identity-service
+                port:
+                  number: 80
+
+---
+# Keeps at least one pod serving during node drains and cluster upgrades.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: identity-service
+  namespace: identity-v1
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: identity-service

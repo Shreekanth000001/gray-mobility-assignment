@@ -388,6 +388,8 @@ def health() -> Dict[str, str]:
 def get_products():
     return {"products": ["EV Truck Heavy", "EV Delivery Van", "EV Battery Pack"]}
 
-@app.get("/products/search", summary="Search products (Basic)")
-def search_products_basic():
-    return {"results": ["EV Truck Heavy"]}
+@app.get("/products/search", summary="Search products (Enhanced)")
+def search_products_enhanced(keyword: Optional[str] = None):
+    if not keyword:
+        raise HTTPException(status_code=400, detail="Keyword query parameter is required")
+    return {"results": f"Found items matching '{keyword}'"}

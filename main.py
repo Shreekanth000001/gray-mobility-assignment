@@ -383,3 +383,7 @@ def identify(
 @app.get("/health", summary="Liveness probe")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+@app.get("/products", summary="List all products")
+def get_products():
+    return {"products": ["EV Truck Heavy", "EV Delivery Van", "EV Battery Pack"]}
